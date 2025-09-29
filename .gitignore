@@ -9,6 +9,7 @@
 *_files/
 
 # Quarto system files
+_quarto.yml
 .quarto/
 _site/
 
@@ -19,6 +20,8 @@ _site/
 # Session Data files
 .RData
 .RDataTmp
+.RData*
+*.Rdata
 
 # User-specific files
 .Ruserdata
