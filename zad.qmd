@@ -1,0 +1,162 @@
+---
+title: "Zadanie"
+author: "Bartosz Czyż"
+date: today
+format: 
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 4
+    toc-location: right
+    toc-title: "Spis treści"
+    number-sections: true
+    number-depth: 4
+    code-fold: show
+    code-summary: "Show the code"
+    code-tools: true
+    code-block-bg: true
+    code-block-border-left: "black"
+    code-line-numbers: false
+    code-copy: true
+    smooth-scroll: true
+    anchor-sections: true
+    link-external-icon: true
+    link-external-newwindow: true
+    theme:
+        light: cosmo
+        dark: darkly
+    fontsize: 1.0em
+    linestretch: 1.5
+    fig-align: center
+    fig-height: 10
+    fig-width: 8
+    mermaid-format: svg
+editor: 
+  markdown: 
+    wrap: 72
+execute:
+  warning: false
+  echo: true
+  error: false
+  cache: false
+editor_options: 
+  chunk_output_type: console
+---
+
+## Load packages
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(stringr)
+library(vip)
+library(pdp)
+library(DALEX)
+library(DALEXtra)
+library(bestNormalize)
+library(rules)
+library(baguette)
+library(finetune)
+library(doParallel)
+library(skimr)
+library(janitor)
+library(corrplot)
+library(naniar)
+library(glmnet)
+library(glmnet)
+library(kernlab)
+library(kknn)
+library(ranger)
+library(xgboost)
+library(gt)
+
+tidymodels_prefer()
+```
+
+## Read
+
+```{r}
+house_data <- read_csv("train.csv") |>
+  clean_names() |>
+  mutate(id = as.character(id))
+
+miss_var_summary(house_data)
+
+# Remove columns with too many missing values
+house_data <- house_data |>
+  select(-c(pool_qc, misc_feature, alley, fence, fireplace_qu,
+            utilities, street, land_slope, roof_matl, heating,
+            electrical, functional)) |>
+  mutate(across(where(is.character), as.factor)) |>
+  mutate(ms_sub_class = as.factor(ms_sub_class)) |>
+  mutate(across(where(is.factor), ~fct_explicit_na(., na_level = "Missing"))) |>
+  select(!where(~is.factor(.) && n_distinct(.) == 1))
+
+house_data |> summary()
+glimpse(house_data)
+skim(house_data)
+```
+
+## Data Exploration
+
+```{r}
+# Target variable distribution
+p1 <- ggplot(house_data, aes(x = sale_price)) +
+  geom_histogram(fill = "blue", alpha = 0.6, bins = 30) +
+  labs(title = "Distribution of Sale Prices")
+
+p2 <- ggplot(house_data, aes(x = log(sale_price))) +
+  geom_histogram(fill = "red", alpha = 0.6, bins = 30) +
+  labs(title = "Distribution of Log-Transformed Sale Prices")
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+
+# Correlation matrix for numeric variables
+numeric_vars <- house_data |>
+  select(where(is.numeric)) |>
+  cor(use = "complete.obs")
+corrplot(numeric_vars, method = "circle", type = "upper", tl.cex = 0.6)
+
+# Missing values analysis
+missing_summary <- house_data |>
+  summarise(across(everything(), ~sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_count") |>
+  filter(missing_count > 0) |>
+  arrange(desc(missing_count))
+
+ggplot(missing_summary, aes(x = reorder(variable, -missing_count), y = missing_count)) +
+  geom_col(fill = "red", alpha = 0.6) +
+  coord_flip() +
+  labs(title = "Variables with Missing Values", x = "Variable", y = "Missing Count")
+```
+
+## Data splitting
+
+```{r}
+set.seed(123)
+house_split <- initial_split(house_data, strata = sale_price, prop = 0.8)
+house_train <- training(house_split)
+house_test  <- testing(house_split)
+
+house_folds <- vfold_cv(house_train, strata = sale_price, v = 5, repeats = 3)
+```
+
+## Recipe Definitions
+
+```{r}
+# Basic recipe for linear models, SVM, KNN, etc.
+basic_rec <- recipe(sale_price ~ ., data = house_train) |>
+  update_role(id, new_role = "ID") |>
+  step_rm(id) |>
+  step_mutate(ms_sub_class = as.factor(ms_sub_class)) |>
+  step_novel(all_nominal_predictors()) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_impute_knn(all_numeric_predictors()) |>
+  step_log(sale_price, offset = 1) |>
+  step_nzv(all_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  # Add this step to remove zero-variance columns after dummy coding
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+```
+
