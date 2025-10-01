@@ -269,3 +269,196 @@ race_ctrl <- control_race(
 #save(tune_results, file = "house_tune_results.Rdata")
 ```
 
+## Result Analysis
+
+```{r}
+load("house_tune_results.Rdata")
+
+# Check which models worked
+tune_results |>
+  rank_results(select_best = TRUE) |>
+  filter(.metric == "rmse") |>
+  select(wflow_id, mean, std_err, model, preprocessor) |>
+  knitr::kable()
+
+# Visualization of results
+autoplot(tune_results, select_best = TRUE, metric = "rmse") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Collect best models
+best_results <- tune_results |>
+  rank_results(select_best = TRUE) |>
+  filter(.metric == "rmse") |>
+  group_by(wflow_id) |>
+  slice(1) |>
+  ungroup()
+
+metrics <- metric_set(rmse, rsq, mae)
+
+best_models <- list()
+for (i in 1:nrow(best_results)) {
+  workflow_id <- best_results$wflow_id[i]
+  config <- best_results$.config[i]
+  
+  best_models[[workflow_id]] <- tune_results |>
+    extract_workflow(id = workflow_id) |>
+    finalize_workflow(select_best(
+      extract_workflow_set_result(tune_results, id = workflow_id),
+      metric = "rmse"
+    )) |>
+    last_fit(split = house_split, metrics = metrics) 
+}
+save(best_models, file = "best_models.Rdata")
+```
+
+## Final Evaluation
+
+```{r}
+# Collect metrics
+final_metrics <- best_models |>
+  map_dfr(~collect_metrics(.x), .id = "wflow_id") |>
+  filter(.metric == "rmse") |>
+  arrange(.estimate)
+
+final_metrics |>
+  knitr::kable()
+
+# Variable importance for top models
+top_models <- final_metrics |>
+  slice(1:3) |>
+  pull(wflow_id)
+
+for (model in top_models) {
+  if (model %in% names(best_models)) {
+    workflow <- extract_workflow(best_models[[model]])
+    fit <- extract_fit_parsnip(workflow)
+    
+    if ("ranger" %in% class(fit$fit) | "xgb.Booster" %in% class(fit$fit)) {
+      p <- vip(fit) + 
+        ggtitle(paste("Variable Importance -", model))
+      print(p)
+    }
+  }
+}
+
+# Final predictions comparison
+all_predictions <- best_models |>
+  map_dfr(~collect_predictions(.x), .id = "wflow_id") |>
+  left_join(final_metrics |> select(wflow_id, rmse = .estimate), by = "wflow_id") |>
+  mutate(wflow_id = fct_reorder(wflow_id, rmse))
+
+ggplot(all_predictions, aes(x = sale_price, y = .pred, color = wflow_id)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(intercept = 0, slope = 1, color = "black") +
+  facet_wrap(~wflow_id, scales = "free") +
+  labs(title = "Actual vs Predicted Sale Prices by Model",
+       x = "Actual Price (log)",
+       y = "Predicted Price (log)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Model performance comparison
+performance_plot <- final_metrics |>
+  mutate(wflow_id = fct_reorder(wflow_id, .estimate)) |>
+  ggplot(aes(x = wflow_id, y = .estimate, fill = wflow_id)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Model Performance Comparison (RMSE)",
+       x = "Model",
+       y = "RMSE") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+performance_plot
+```
+
+```{r}
+load("best_models.Rdata")
+best_results <- tune_results |>
+  split(~wflow_id) |>
+  map(\(x) extract_workflow_set_result(x, id = x$wflow_id) |> select_best(metric = "rmse"))
+
+test_metrics <- best_models |> 
+  map_dfr(~collect_metrics(.x), .id = "mod") |> 
+  select(mod, .metric, .estimate) |> 
+  rename(test = .estimate)
+
+validation_metrics <- tune_results |> 
+  rank_results(select_best = TRUE) |> 
+  select(wflow_id, .metric, mean) |> 
+  rename(mod = wflow_id, validation = mean)
+
+por_test_valid <- test_metrics |>
+  full_join(validation_metrics, by = c("mod", ".metric")) |>
+  filter(!(is.na(test) & is.na(validation))) |>
+  pivot_wider(
+    names_from = .metric, 
+    values_from = c(test, validation)
+  )
+
+por_test_valid |> gt() |> 
+  gt::tab_header(title = "Porównanie metryk: Test vs Walidacja")
+
+best_models |>
+  map_dfr(~collect_metrics(.x), .id = "mod") |>
+  ggplot(aes(mod, .estimate, color = mod)) +
+  geom_point(size = 3) +
+  facet_wrap(~.metric, scales = "free_y") +
+  theme_minimal() +
+  labs(x = "Model", y = "Wartość metryki", title = "Porównanie modeli")
+```
+
+## Plots
+
+```{r}
+# Best compact version
+best_plot_data <- test_metrics |>
+  full_join(validation_metrics, by = c("mod", ".metric")) |>
+  filter(.metric %in% c("rmse", "rsq")) |>
+  pivot_longer(
+    cols = c(test, validation),
+    names_to = "dataset",
+    values_to = "value"
+  )
+
+# Combined bar plot
+p_combined <- ggplot(best_plot_data, aes(x = mod, y = value, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  facet_wrap(~ .metric, scales = "free_y", 
+             labeller = as_labeller(c(rmse = "RMSE", rsq = "R²"))) +
+  labs(
+    title = "Porównanie metryk RMSE i R²: Test vs Walidacja",
+    x = "Model",
+    y = "Wartość metryki",
+    fill = "Zbiór danych"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  ) +
+  scale_fill_manual(values = c("validation" = "#E41A1C", "test" = "#377EB8"))
+
+print(p_combined)
+
+# Difference plot
+diff_plot <- best_plot_data |>
+  pivot_wider(names_from = dataset, values_from = value) |>
+  mutate(difference = test - validation) |>
+  ggplot(aes(x = mod, y = difference, fill = difference > 0)) +
+  geom_col() +
+  facet_wrap(~ .metric, scales = "free_y") +
+  labs(
+    title = "Różnica między testem a walidacją (Test - Walidacja)",
+    x = "Model",
+    y = "Różnica",
+    fill = "Test > Walidacja"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  geom_hline(yintercept = 0, linetype = "dashed")
+
+print(diff_plot)
+```
